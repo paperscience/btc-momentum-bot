@@ -1,0 +1,26 @@
+services:
+  - type: worker
+    name: btc-momentum-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    plan: free          # upgrade to starter ($7/mo) for always-on
+    envVars:
+      - key: PAIR
+        value: XBTGBP
+      - key: POLL_SEC
+        value: "15"
+      - key: SESSION_SEC
+        value: "86400"   # 24 h per session
+      - key: START_GBP
+        value: "10000"
+      - key: FEE_RATE
+        value: "0.0026"
+      - key: TP_PCT
+        value: "0.0070"  # take-profit +0.70%
+      - key: SL_PCT
+        value: "0.0040"  # stop-loss   -0.40%
+      - key: MOMENTUM_MIN
+        value: "0.0003"
+      - key: TRADE_FRAC
+        value: "0.90"
