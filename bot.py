@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # ── Config (override via env vars on Render) ──────────────────────────────────
-PAIR           = os.getenv("PAIR",            "XBTGBP")
+PAIR           = os.getenv("PAIR",            "ETHGBP")
 POLL_SEC       = int(os.getenv("POLL_SEC",    "15"))
 SESSION_SEC    = int(os.getenv("SESSION_SEC", "86400"))   # 24 h per session
 START_GBP      = float(os.getenv("START_GBP", "10000"))
