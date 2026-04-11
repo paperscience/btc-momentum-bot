@@ -10,7 +10,9 @@ Strategy:
            or momentum reversal (only if price > break-even)
 """
 
-import os, time, logging, requests
+import os, time, logging, subprocess, sys
+subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "requests"])
+import requests
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
