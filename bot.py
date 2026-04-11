@@ -2,7 +2,7 @@
 """
 BTC/GBP fee-aware momentum paper trader
 Runs continuously on Render as a Background Worker.
-Uses Kraken public REST API — no CLI or API key required.
+Uses Kraken public REST API — no external dependencies.
 
 Strategy:
   ENTRY  — 2 consecutive rising ticks AND cumulative rise > MOMENTUM_MIN
@@ -10,23 +10,24 @@ Strategy:
            or momentum reversal (only if price > break-even)
 """
 
-import os, time, logging, subprocess, sys
-subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "requests"])
-import requests
+import os, time, logging, json
+from urllib.request import urlopen, Request
+from urllib.parse import urlencode
+from urllib.error import URLError
 from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
 # ── Config (override via env vars on Render) ──────────────────────────────────
 PAIR           = os.getenv("PAIR",            "XBTGBP")
-POLL_SEC       = int(os.getenv("POLL_SEC",    "15"))      # seconds between ticks
-SESSION_SEC    = int(os.getenv("SESSION_SEC", "86400"))   # reset every 24 h
+POLL_SEC       = int(os.getenv("POLL_SEC",    "15"))
+SESSION_SEC    = int(os.getenv("SESSION_SEC", "86400"))   # 24 h per session
 START_GBP      = float(os.getenv("START_GBP", "10000"))
-FEE_RATE       = float(os.getenv("FEE_RATE",  "0.0026"))  # 0.26% per leg
+FEE_RATE       = float(os.getenv("FEE_RATE",  "0.0026"))
 TP_PCT         = float(os.getenv("TP_PCT",    "0.0070"))  # +0.70% take-profit
 SL_PCT         = float(os.getenv("SL_PCT",    "0.0040"))  # -0.40% stop-loss
-MOMENTUM_MIN   = float(os.getenv("MOMENTUM_MIN", "0.0003"))  # min 2-tick rise
-TRADE_FRAC     = float(os.getenv("TRADE_FRAC", "0.90"))   # 90% of cash per buy
+MOMENTUM_MIN   = float(os.getenv("MOMENTUM_MIN", "0.0003"))
+TRADE_FRAC     = float(os.getenv("TRADE_FRAC", "0.90"))
 KRAKEN_API     = "https://api.kraken.com/0/public"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -38,13 +39,11 @@ logging.basicConfig(
 log = logging.getLogger("momentum")
 
 # ── Kraken REST helpers ───────────────────────────────────────────────────────
-session = requests.Session()
-session.headers.update({"User-Agent": "btc-momentum-bot/2.0"})
-
 def get_ticker(pair: str) -> dict:
-    r = session.get(f"{KRAKEN_API}/Ticker", params={"pair": pair}, timeout=10)
-    r.raise_for_status()
-    data = r.json()
+    url = f"{KRAKEN_API}/Ticker?{urlencode({'pair': pair})}"
+    req = Request(url, headers={"User-Agent": "btc-momentum-bot/2.0"})
+    with urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
     if data.get("error"):
         raise RuntimeError(f"Kraken API error: {data['error']}")
     return next(iter(data["result"].values()))
@@ -69,10 +68,10 @@ class PaperAccount:
         return self.btc > 0.00001
 
     def buy_market(self, price: float) -> dict:
-        spend  = round(self.cash * TRADE_FRAC, 8)
-        fee    = round(spend * FEE_RATE, 8)
+        spend     = round(self.cash * TRADE_FRAC, 8)
+        fee       = round(spend * FEE_RATE, 8)
         net_spend = spend + fee
-        volume = round((spend - fee) / price, 8)
+        volume    = round((spend - fee) / price, 8)
         self.cash        -= net_spend
         self.btc         += volume
         self.entry_price  = price
@@ -106,13 +105,12 @@ class PaperAccount:
         return self.cash + self.btc * current_price
 
     def print_summary(self, current_price: float):
-        value   = self.portfolio_value(current_price)
-        abs_pnl = value - self.session_start_cash
-        pct_pnl = abs_pnl / self.session_start_cash * 100
-        sells   = [t for t in self.trades if t["side"] == "SELL"]
-        total_net = sum(t["net_pnl"] for t in sells if t["net_pnl"])
+        value      = self.portfolio_value(current_price)
+        abs_pnl    = value - self.session_start_cash
+        pct_pnl    = abs_pnl / self.session_start_cash * 100
+        sells      = [t for t in self.trades if t["side"] == "SELL"]
+        total_net  = sum(t["net_pnl"] for t in sells if t["net_pnl"])
         total_fees = sum(t["fee"] for t in self.trades)
-
         log.info("─" * 60)
         log.info("SESSION SUMMARY")
         log.info("  Starting balance : £%.2f",  self.session_start_cash)
@@ -142,7 +140,7 @@ def run_session(account: PaperAccount):
         tick += 1
         try:
             price = mid_price(PAIR)
-        except Exception as exc:
+        except (URLError, Exception) as exc:
             log.warning("Price fetch failed: %s — retrying next tick", exc)
             time.sleep(POLL_SEC)
             continue
@@ -153,7 +151,6 @@ def run_session(account: PaperAccount):
         # ── EXIT ──────────────────────────────────────────────────────────────
         if account.in_position:
             gain = (price - account.entry_price) / account.entry_price
-
             if gain >= TP_PCT:
                 account.sell_market(price, "TAKE-PROFIT")
             elif gain <= -SL_PCT:
@@ -174,7 +171,6 @@ def run_session(account: PaperAccount):
             up1      = prices[-1] > prices[-2]
             up2      = prices[-2] > prices[-3]
             cum_rise = (prices[-1] - prices[-3]) / prices[-3]
-
             if up1 and up2 and cum_rise >= MOMENTUM_MIN:
                 account.buy_market(price)
             else:
@@ -186,7 +182,6 @@ def run_session(account: PaperAccount):
             log.info("tick=%-3d  £%.2f  %+.3f%%  → collecting baseline...",
                      tick, price, move_pct)
 
-        # Keep price history bounded
         if len(prices) > 100:
             prices = prices[-50:]
 
@@ -197,7 +192,7 @@ def run_session(account: PaperAccount):
         price = mid_price(PAIR)
         account.sell_market(price, "SESSION-END")
 
-    account.print_summary(price if account.btc == 0 else mid_price(PAIR))
+    account.print_summary(price if not account.in_position else mid_price(PAIR))
 
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 def main():
@@ -212,7 +207,6 @@ def main():
         except Exception as exc:
             log.error("Session crashed: %s — restarting in 60s", exc, exc_info=True)
             time.sleep(60)
-
         log.info("Session complete. Restarting in 30s...")
         time.sleep(30)
 
