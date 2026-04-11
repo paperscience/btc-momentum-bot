@@ -1,13 +1,13 @@
 services:
-  - type: worker
+  - type: web
     name: btc-momentum-bot
     runtime: python
-    buildCommand: ""
+    buildCommand: echo ok
     startCommand: python3 bot.py
     plan: free
     envVars:
       - key: PAIR
-        value: XBTGBP
+        value: ETHGBP
       - key: POLL_SEC
         value: "15"
       - key: SESSION_SEC
