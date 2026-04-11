@@ -3,7 +3,7 @@ services:
     name: btc-momentum-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+    startCommand: python3 bot.py
     plan: free          # upgrade to starter ($7/mo) for always-on
     envVars:
       - key: PAIR
