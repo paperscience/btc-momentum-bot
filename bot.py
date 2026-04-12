@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
 """
-ETH/GBP fee-aware momentum paper trader — Kraken Pro, limit orders, long + short
-Runs on Render as a Web Service. No external dependencies.
-
-Order logic:
-  LONG  entry  — 2 rising ticks  → limit BUY  at bid  (maker 0.14%)
-  SHORT entry  — 2 falling ticks → limit SELL at ask  (maker 0.14%)
-  TP exit      — limit order at target price           (maker 0.14%)
-  SL / reversal— market order                          (taker 0.24%)
-  Margin fees  — 0.02% open + 0.02% per 4h rollover (Kraken rates)
-
-Round-trip fees (excl. margin):
-  Limit/Limit  : 0.14% + 0.14% = 0.28%
-  Limit/Market : 0.14% + 0.24% = 0.38%
+Multi-pair momentum paper trader — long + short + pyramiding
+Pairs:   ETH/GBP, BTC/GBP, SOL/GBP (configurable)
+Capital: £10,000 — 25% initial per position, 8% pyramid add on winners
+Strategy:
+  ENTRY    2 consecutive ticks in same direction + cumulative move > MOMENTUM_MIN
+           → limit order at bid (long) or ask (short) — maker fee 0.14%
+  PYRAMID  when unrealised gain > PYRAMID_TRIGGER (0.25%)
+           → add one tranche at current bid/ask — maker fee 0.14%
+  TP       limit order at entry × (1 ± TP_PCT) — closes full position
+  SL       market order at entry × (1 ∓ SL_PCT) — closes full position
+  REVERSAL market exit if 2 counter-ticks and above break-even
+  GUARD    skip entry if ≥ MAX_SAME_DIR pairs already in same direction
+           skip any order if available cash < RESERVE_MIN
 """
 
 import os, time, logging, json, threading
+from collections import deque
 from urllib.request import urlopen, Request
 from urllib.parse import urlencode
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -23,22 +24,31 @@ from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Optional
 
+# ── Direction / order-type constants ─────────────────────────────────────────
+LONG,  SHORT  = "LONG",  "SHORT"
+BUY,   SELL   = "BUY",   "SELL"
+LIMIT, MARKET = "LIMIT", "MARKET"
+
 # ── Config ────────────────────────────────────────────────────────────────────
-PAIR          = os.getenv("PAIR",           "ETHGBP")
-POLL_SEC      = int(os.getenv("POLL_SEC",   "15"))
-SESSION_SEC   = int(os.getenv("SESSION_SEC","86400"))
-START_GBP     = float(os.getenv("START_GBP","10000"))
-FEE_MAKER     = float(os.getenv("FEE_MAKER","0.0014"))   # 0.14% Kraken Pro maker
-FEE_TAKER     = float(os.getenv("FEE_TAKER","0.0024"))   # 0.24% Kraken Pro taker
-MARGIN_OPEN   = float(os.getenv("MARGIN_OPEN","0.0002")) # 0.02% margin opening fee
-MARGIN_4H     = float(os.getenv("MARGIN_4H","0.0002"))   # 0.02% rollover per 4h
-TP_PCT        = float(os.getenv("TP_PCT",  "0.0050"))    # +/-0.50% take-profit
-SL_PCT        = float(os.getenv("SL_PCT",  "0.0030"))    # +/-0.30% stop-loss
-MOMENTUM_MIN  = float(os.getenv("MOMENTUM_MIN","0.0002"))
-TRADE_FRAC    = float(os.getenv("TRADE_FRAC","0.90"))
-LIMIT_EXPIRY  = int(os.getenv("LIMIT_EXPIRY","3"))       # ticks before cancelling unfilled limit
-PORT          = int(os.getenv("PORT","8080"))
-KRAKEN_API    = "https://api.kraken.com/0/public"
+PAIRS           = os.getenv("PAIRS",    "ETHGBP,XBTGBP,SOLGBP").split(",")
+POLL_SEC        = int(os.getenv("POLL_SEC",    "15"))
+SESSION_SEC     = int(os.getenv("SESSION_SEC", "86400"))
+TOTAL_CAPITAL   = float(os.getenv("TOTAL_CAPITAL", "10000"))
+INITIAL_FRAC    = float(os.getenv("INITIAL_FRAC",  "0.25"))    # 25% per initial entry
+PYRAMID_FRAC    = float(os.getenv("PYRAMID_FRAC",  "0.08"))    # 8% pyramid add
+PYRAMID_TRIGGER = float(os.getenv("PYRAMID_TRIGGER","0.0025")) # add when gain > 0.25%
+RESERVE_MIN     = float(os.getenv("RESERVE_MIN",   "500"))     # always keep £500 free
+MAX_SAME_DIR    = int(os.getenv("MAX_SAME_DIR",    "2"))       # max pairs per direction
+FEE_MAKER       = float(os.getenv("FEE_MAKER",  "0.0014"))
+FEE_TAKER       = float(os.getenv("FEE_TAKER",  "0.0024"))
+MARGIN_OPEN     = float(os.getenv("MARGIN_OPEN","0.0002"))
+MARGIN_4H       = float(os.getenv("MARGIN_4H",  "0.0002"))
+TP_PCT          = float(os.getenv("TP_PCT",  "0.0050"))
+SL_PCT          = float(os.getenv("SL_PCT",  "0.0030"))
+MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0002"))
+LIMIT_EXPIRY    = int(os.getenv("LIMIT_EXPIRY",  "3"))
+PORT            = int(os.getenv("PORT", "8080"))
+KRAKEN_API      = "https://api.kraken.com/0/public"
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -48,462 +58,530 @@ logging.basicConfig(
 )
 log = logging.getLogger("momentum")
 
-# ── Shared state ──────────────────────────────────────────────────────────────
-state = {
-    "pair": PAIR,
-    "started_at": datetime.now(timezone.utc).isoformat(),
-    "session_started_at": None,
-    "tick": 0, "last_price": None, "last_bid": None, "last_ask": None,
-    "position_type": None,      # "long", "short", or None
-    "entry_price": None, "tp_target": None, "sl_level": None,
-    "current_gain_pct": None, "pending_order": None,
-    "cash": START_GBP, "btc": 0.0, "portfolio_value": START_GBP,
-    "trades": [], "session_pnl": 0.0, "total_fees": 0.0,
-    "long_trades": 0, "short_trades": 0, "status": "starting...",
-}
-state_lock = threading.Lock()
-
 # ── Kraken REST ───────────────────────────────────────────────────────────────
-def get_ticker(pair: str) -> dict:
+def fetch_prices(pair: str) -> tuple:
+    """Return (bid, ask, mid) for a pair."""
     url = f"{KRAKEN_API}/Ticker?{urlencode({'pair': pair})}"
-    req = Request(url, headers={"User-Agent": "momentum-bot/4.0"})
+    req = Request(url, headers={"User-Agent": "momentum-bot/5.0"})
     with urlopen(req, timeout=10) as r:
         data = json.loads(r.read())
     if data.get("error"):
         raise RuntimeError(f"Kraken error: {data['error']}")
-    return next(iter(data["result"].values()))
-
-def get_prices(pair: str):
-    t = get_ticker(pair)
-    bid = float(t["b"][0]); ask = float(t["a"][0])
+    t = next(iter(data["result"].values()))
+    bid, ask = float(t["b"][0]), float(t["a"][0])
     return bid, ask, (bid + ask) / 2
 
-def _ts():
+def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
-# ── Paper trading account ─────────────────────────────────────────────────────
+# ── Domain model ──────────────────────────────────────────────────────────────
 @dataclass
-class PaperAccount:
-    cash:         float = START_GBP
-    btc:          float = 0.0         # > 0 = long position held
-    short_vol:    float = 0.0         # > 0 = short position open (borrowed ETH sold)
-    entry_price:  Optional[float] = None
-    entry_cost:   Optional[float] = None  # cash deployed
-    entry_time:   Optional[float] = None  # unix ts for rollover calc
-    break_even:   Optional[float] = None
-    tp_target:    Optional[float] = None
-    sl_level:     Optional[float] = None
-    position_type: Optional[str] = None  # "long" | "short"
-    pending:      Optional[dict] = None  # pending limit order
-    trades:       list = field(default_factory=list)
-    start_cash:   float = START_GBP
+class Tranche:
+    price:      float
+    volume:     float
+    cost:       float
+    fee:        float
+    is_pyramid: bool
+    tp_target:  float
+    sl_level:   float
+    break_even: float
+    entry_time: float = field(default_factory=time.time)
+
+@dataclass
+class Position:
+    pair:      str
+    direction: str
+    tranches:  list  = field(default_factory=list)
+    pending:   Optional[dict] = None
 
     @property
-    def in_long(self):  return self.btc > 0.00001
+    def in_position(self) -> bool: return bool(self.tranches)
     @property
-    def in_short(self): return self.short_vol > 0.00001
+    def has_pending(self) -> bool: return self.pending is not None
     @property
-    def in_position(self): return self.in_long or self.in_short
+    def pyramided(self) -> bool:   return len(self.tranches) > 1
     @property
-    def has_pending(self): return self.pending is not None
+    def total_volume(self) -> float: return sum(t.volume for t in self.tranches)
+    @property
+    def total_cost(self) -> float:   return sum(t.cost   for t in self.tranches)
+    @property
+    def tp_target(self) -> Optional[float]:
+        return self.tranches[-1].tp_target if self.tranches else None
+    @property
+    def sl_level(self) -> Optional[float]:
+        return self.tranches[0].sl_level if self.tranches else None
+    @property
+    def break_even(self) -> Optional[float]:
+        return self.tranches[-1].break_even if self.tranches else None
+    @property
+    def avg_entry(self) -> float:
+        tv = self.total_volume
+        return sum(t.price * t.volume for t in self.tranches) / tv if tv else 0.0
 
-    # ── Margin rollover fee ───────────────────────────────────────────────────
     def rollover_fee(self) -> float:
-        if not self.entry_time or not self.entry_cost:
-            return 0.0
-        hours = (time.time() - self.entry_time) / 3600
-        periods = int(hours / 4)  # fee charged per 4h block
-        return round(self.entry_cost * MARGIN_4H * periods, 8)
+        if not self.tranches: return 0.0
+        hours   = (time.time() - self.tranches[0].entry_time) / 3600
+        periods = int(hours / 4)
+        return sum(t.cost * MARGIN_4H * periods for t in self.tranches)
 
-    # ── LONG entry ────────────────────────────────────────────────────────────
-    def place_limit_buy(self, bid: float):
-        spend = round(self.cash * TRADE_FRAC, 8)
-        self.pending = {"side": "long", "limit": bid, "spend": spend, "ticks": 0}
-        log.info("LIMIT BUY  pending @ £%.2f (spend=£%.2f)", bid, spend)
+    def current_gain(self, price: float) -> float:
+        avg = self.avg_entry
+        if not avg: return 0.0
+        return ((price - avg) / avg if self.direction == LONG
+                else (avg - price) / avg)
 
-    def try_fill_buy(self, bid: float, ask: float) -> bool:
-        p = self.pending; p["ticks"] += 1
-        if bid <= p["limit"] or ask <= p["limit"]:
-            price = p["limit"]; spend = p["spend"]
-            margin_fee = round(spend * MARGIN_OPEN, 8)
-            trade_fee  = round(spend * FEE_MAKER, 8)
-            total_fee  = margin_fee + trade_fee
-            net_spend  = spend + total_fee
-            volume     = round((spend - trade_fee) / price, 8)
-            self.cash       -= net_spend
-            self.btc        += volume
-            self.entry_price = price; self.entry_cost = spend
-            self.entry_time  = time.time()
-            self.position_type = "long"
-            self.break_even  = price * (1 + FEE_MAKER + FEE_TAKER)
-            self.tp_target   = round(price * (1 + TP_PCT), 4)
-            self.sl_level    = round(price * (1 - SL_PCT), 4)
-            self.pending     = None
-            t = dict(side="BUY", direction="LONG", order="LIMIT", time=_ts(),
-                     price=price, volume=volume, fee=total_fee, net_pnl=None,
-                     reason="MOMENTUM↑")
-            self.trades.append(t)
-            log.info("LONG  FILLED %.6f @ £%.2f | fee=£%.4f | TP=£%.2f SL=£%.2f",
-                     volume, price, total_fee, self.tp_target, self.sl_level)
-            return True
-        if p["ticks"] >= LIMIT_EXPIRY:
-            log.info("LIMIT BUY expired"); self.pending = None
-        return False
+@dataclass
+class Portfolio:
+    cash:         float = TOTAL_CAPITAL
+    positions:    dict  = field(default_factory=dict)  # pair → Position
+    trades:       list  = field(default_factory=list)
+    # Running totals — maintained incrementally, never recomputed
+    session_pnl:  float = 0.0
+    total_fees:   float = 0.0
+    long_count:   int   = 0
+    short_count:  int   = 0
 
-    # ── LONG exit ─────────────────────────────────────────────────────────────
-    def close_long_limit(self, price: float) -> dict:
-        return self._close_long(self.tp_target, FEE_MAKER, "TAKE-PROFIT↑ (limit)")
+    def direction_count(self, direction: str) -> int:
+        return sum(1 for p in self.positions.values()
+                   if p.in_position and p.direction == direction)
 
-    def close_long_market(self, price: float, reason: str) -> dict:
-        return self._close_long(price, FEE_TAKER, reason)
+    def _can_spend(self, amount: float) -> bool:
+        return self.cash - amount >= RESERVE_MIN
 
-    def _close_long(self, price: float, fee_rate: float, reason: str) -> dict:
-        volume    = self.btc
-        proceeds  = round(volume * price, 8)
-        trade_fee = round(proceeds * fee_rate, 8)
-        roll_fee  = self.rollover_fee()
+    def portfolio_value(self, prices: dict) -> float:
+        """Total value: cash + unrealised P&L across all open positions."""
+        value = self.cash
+        for pair, pos in self.positions.items():
+            if pos.in_position and pair in prices:
+                price = prices[pair]
+                if pos.direction == LONG:
+                    value += pos.total_volume * price
+                else:
+                    value += sum((t.price - price) * t.volume for t in pos.tranches)
+        return value
+
+    # ── Entry ─────────────────────────────────────────────────────────────────
+    def place_entry(self, pair: str, direction: str, limit_price: float):
+        spend = round(self.cash * INITIAL_FRAC, 2)
+        if not self._can_spend(spend):
+            log.info("%-8s SKIP %s — low cash (need £%.0f reserve)", pair, direction, RESERVE_MIN)
+            return
+        if self.direction_count(direction) >= MAX_SAME_DIR:
+            log.info("%-8s SKIP %s — already %d pairs in %s", pair, direction, MAX_SAME_DIR, direction)
+            return
+        pos = self.positions.setdefault(pair, Position(pair=pair, direction=direction))
+        pos.direction = direction
+        pos.pending   = {"type": "initial", "limit": limit_price, "spend": spend, "ticks": 0}
+        log.info("%-8s LIMIT %s pending @ £%.2f (spend=£%.2f)", pair, direction, limit_price, spend)
+
+    def place_pyramid(self, pair: str, limit_price: float):
+        pos   = self.positions.get(pair)
+        spend = round(self.cash * PYRAMID_FRAC, 2)
+        if not pos or not pos.in_position or pos.pyramided or pos.has_pending:
+            return
+        if not self._can_spend(spend):
+            log.info("%-8s SKIP pyramid — low cash", pair)
+            return
+        pos.pending = {"type": "pyramid", "limit": limit_price, "spend": spend, "ticks": 0}
+        log.info("%-8s PYRAMID %s pending @ £%.2f (spend=£%.2f)", pair, pos.direction, limit_price, spend)
+
+    # ── Fill ──────────────────────────────────────────────────────────────────
+    def try_fill(self, pair: str, bid: float, ask: float) -> bool:
+        pos = self.positions.get(pair)
+        if not pos or not pos.has_pending:
+            return False
+        p = pos.pending
+        p["ticks"] += 1
+
+        # Fill condition: long fills when ask drops to limit; short when bid rises to limit
+        filled = (ask <= p["limit"] if pos.direction == LONG else bid >= p["limit"])
+        if not filled:
+            if p["ticks"] >= LIMIT_EXPIRY:
+                log.info("%-8s LIMIT %s expired", pair, pos.direction)
+                pos.pending = None
+            return False
+
+        price     = p["limit"]
+        spend     = p["spend"]
+        trade_fee = round(spend * FEE_MAKER,   8)
+        marg_fee  = round(spend * MARGIN_OPEN, 8)
+        total_fee = trade_fee + marg_fee
+        volume    = round((spend - trade_fee) / price, 8)
+
+        # For longs, cash leaves immediately. For shorts, only fees leave cash.
+        self.cash -= (spend + total_fee) if pos.direction == LONG else total_fee
+
+        tp = round(price * (1 + TP_PCT) if pos.direction == LONG else price * (1 - TP_PCT), 4)
+        sl = round(price * (1 - SL_PCT) if pos.direction == LONG else price * (1 + SL_PCT), 4)
+        be = (price * (1 + FEE_MAKER + FEE_TAKER) if pos.direction == LONG
+              else price * (1 - FEE_MAKER - FEE_TAKER))
+
+        tranche = Tranche(price=price, volume=volume, cost=spend, fee=total_fee,
+                          is_pyramid=p["type"] == "pyramid",
+                          tp_target=tp, sl_level=sl, break_even=be)
+        pos.tranches.append(tranche)
+        pos.pending = None
+
+        entry_side = BUY if pos.direction == LONG else SELL
+        self.trades.append(dict(
+            pair=pair, side=entry_side, direction=pos.direction, order=LIMIT,
+            time=_ts(), price=price, volume=volume, fee=total_fee,
+            net_pnl=None, reason=f"MOMENTUM{'↑' if pos.direction==LONG else '↓'}",
+            is_pyramid=tranche.is_pyramid,
+        ))
+        self.total_fees += total_fee
+
+        log.info("%-8s %s FILL  %s%.6f @ £%.2f | fee=£%.4f | TP=£%.2f SL=£%.2f%s",
+                 pair, pos.direction, "▲ " if pos.direction == LONG else "▼ ",
+                 volume, price, total_fee, tp, sl,
+                 " [PYRAMID]" if tranche.is_pyramid else "")
+        return True
+
+    # ── Close ─────────────────────────────────────────────────────────────────
+    def close_position(self, pair: str, price: float, reason: str, order_type: str):
+        pos = self.positions.get(pair)
+        if not pos or not pos.in_position:
+            return
+        fee_rate  = FEE_MAKER if order_type == LIMIT else FEE_TAKER
+        roll_fee  = pos.rollover_fee()
+        volume    = pos.total_volume
+        trade_fee = round((volume * price) * fee_rate, 8)
         total_fee = trade_fee + roll_fee
-        net_recv  = proceeds - total_fee
-        gain_pct  = (price - self.entry_price) / self.entry_price * 100
-        net_pnl   = net_recv - self.entry_cost
-        self.cash += net_recv; self.btc = 0.0
-        self._reset_position()
-        t = dict(side="SELL", direction="LONG", order="LIMIT" if "limit" in reason else "MARKET",
-                 time=_ts(), price=price, volume=volume, fee=total_fee,
-                 net_pnl=net_pnl, reason=reason)
-        self.trades.append(t)
-        log.info("LONG  CLOSE %.6f @ £%.2f | fee=£%.4f | net_pnl=£%+.4f (%+.3f%%) | %s",
-                 volume, price, total_fee, net_pnl, gain_pct, reason)
-        return t
 
-    # ── SHORT entry ───────────────────────────────────────────────────────────
-    def place_limit_short(self, ask: float):
-        spend = round(self.cash * TRADE_FRAC, 8)
-        self.pending = {"side": "short", "limit": ask, "spend": spend, "ticks": 0}
-        log.info("LIMIT SHORT pending @ £%.2f (collateral=£%.2f)", ask, spend)
+        if pos.direction == LONG:
+            proceeds = round(volume * price, 8)
+            net_recv = proceeds - total_fee
+            net_pnl  = net_recv - pos.total_cost
+            self.cash += net_recv
+        else:
+            gross_pnl = round((pos.avg_entry - price) * volume, 8)
+            net_pnl   = gross_pnl - total_fee
+            self.cash += net_pnl
 
-    def try_fill_short(self, bid: float, ask: float) -> bool:
-        p = self.pending; p["ticks"] += 1
-        if ask >= p["limit"] or bid >= p["limit"]:
-            price      = p["limit"]; spend = p["spend"]
-            margin_fee = round(spend * MARGIN_OPEN, 8)
-            trade_fee  = round(spend * FEE_MAKER, 8)
-            total_fee  = margin_fee + trade_fee
-            volume     = round((spend - trade_fee) / price, 8)
-            # We've sold volume ETH short; cash increases by proceeds, collateral locked
-            self.cash       -= total_fee          # only fees leave cash now
-            self.short_vol  += volume
-            self.entry_price = price; self.entry_cost = spend
-            self.entry_time  = time.time()
-            self.position_type = "short"
-            self.break_even  = price * (1 - FEE_MAKER - FEE_TAKER)  # min buyback to profit
-            self.tp_target   = round(price * (1 - TP_PCT), 4)        # buy back lower
-            self.sl_level    = round(price * (1 + SL_PCT), 4)        # buy back higher = loss
-            self.pending     = None
-            t = dict(side="SELL", direction="SHORT", order="LIMIT", time=_ts(),
-                     price=price, volume=volume, fee=total_fee, net_pnl=None,
-                     reason="MOMENTUM↓")
-            self.trades.append(t)
-            log.info("SHORT FILLED %.6f @ £%.2f | fee=£%.4f | TP=£%.2f SL=£%.2f",
-                     volume, price, total_fee, self.tp_target, self.sl_level)
-            return True
-        if p["ticks"] >= LIMIT_EXPIRY:
-            log.info("LIMIT SHORT expired"); self.pending = None
-        return False
+        gain_pct = pos.current_gain(price) * 100
+        self.session_pnl += net_pnl
+        self.total_fees  += total_fee
+        if pos.direction == LONG:  self.long_count  += 1
+        else:                      self.short_count += 1
 
-    # ── SHORT exit ────────────────────────────────────────────────────────────
-    def close_short_limit(self, price: float) -> dict:
-        return self._close_short(self.tp_target, FEE_MAKER, "TAKE-PROFIT↓ (limit)")
+        close_side = SELL if pos.direction == LONG else BUY
+        self.trades.append(dict(
+            pair=pair, side=close_side, direction=pos.direction, order=order_type,
+            time=_ts(), price=price, volume=volume, fee=total_fee,
+            net_pnl=net_pnl, reason=reason, is_pyramid=False,
+        ))
 
-    def close_short_market(self, price: float, reason: str) -> dict:
-        return self._close_short(price, FEE_TAKER, reason)
+        log.info("%-8s %s CLOSE %s%.5f @ £%.2f | pnl=£%+.4f (%+.3f%%) | %s",
+                 pair, pos.direction, "▼ " if pos.direction == LONG else "▲ ",
+                 volume, price, net_pnl, gain_pct, reason)
+        del self.positions[pair]
 
-    def _close_short(self, price: float, fee_rate: float, reason: str) -> dict:
-        volume    = self.short_vol
-        # We buy back at price to close the short
-        buyback   = round(volume * price, 8)
-        trade_fee = round(buyback * fee_rate, 8)
-        roll_fee  = self.rollover_fee()
-        total_fee = trade_fee + roll_fee
-        # P&L: we sold at entry_price, buy back at price
-        gross_pnl = round((self.entry_price - price) * volume, 8)
-        net_pnl   = gross_pnl - total_fee
-        gain_pct  = (self.entry_price - price) / self.entry_price * 100
-        self.cash      += net_pnl   # profit/loss added to cash
-        self.short_vol  = 0.0
-        self._reset_position()
-        t = dict(side="BUY", direction="SHORT", order="LIMIT" if "limit" in reason else "MARKET",
-                 time=_ts(), price=price, volume=volume, fee=total_fee,
-                 net_pnl=net_pnl, reason=reason)
-        self.trades.append(t)
-        log.info("SHORT CLOSE %.6f @ £%.2f | fee=£%.4f | net_pnl=£%+.4f (%+.3f%%) | %s",
-                 volume, price, total_fee, net_pnl, gain_pct, reason)
-        return t
-
-    def _reset_position(self):
-        self.entry_price = self.entry_cost = self.entry_time = None
-        self.break_even = self.tp_target = self.sl_level = None
-        self.position_type = None
-
-    def portfolio_value(self, price: float) -> float:
-        long_val  = self.btc * price
-        # Short: unrealised P&L = (entry - current) * volume
-        short_val = ((self.entry_price - price) * self.short_vol
-                     if self.in_short and self.entry_price else 0.0)
-        return self.cash + long_val + short_val
-
-    def current_gain(self, price: float) -> Optional[float]:
-        if self.in_long and self.entry_price:
-            return (price - self.entry_price) / self.entry_price * 100
-        if self.in_short and self.entry_price:
-            return (self.entry_price - price) / self.entry_price * 100
-        return None
+# ── Shared state for status page ──────────────────────────────────────────────
+state      = {"started_at": datetime.now(timezone.utc).isoformat(),
+               "session_started_at": None, "tick": 0,
+               "prices": {}, "positions": {}, "portfolio_value": TOTAL_CAPITAL,
+               "cash": TOTAL_CAPITAL, "session_pnl": 0.0, "total_fees": 0.0,
+               "long_count": 0, "short_count": 0,
+               "trades": [], "status": "starting..."}
+state_lock = threading.Lock()
+trades_version = 0   # incremented only when trades list changes
 
 # ── Strategy ──────────────────────────────────────────────────────────────────
 def run_bot():
+    global trades_version
     while True:
-        account = PaperAccount()
-        prices  = []
-        start   = time.time()
+        portfolio     = Portfolio()
+        price_history = {p: deque(maxlen=3) for p in PAIRS}  # only last 3 needed
+        start         = time.time()
 
         with state_lock:
-            state.update(
-                session_started_at=datetime.now(timezone.utc).isoformat(),
-                tick=0, trades=[], cash=START_GBP, btc=0.0,
-                pending_order=None, position_type=None,
-                long_trades=0, short_trades=0,
-            )
+            state_update(state,
+                         session_started_at=datetime.now(timezone.utc).isoformat(),
+                         tick=0, positions={}, trades=[], cash=TOTAL_CAPITAL,
+                         session_pnl=0.0, total_fees=0.0,
+                         long_count=0, short_count=0, status="watching")
 
-        log.info("NEW SESSION | pair=%s tp=±%.2f%% sl=±%.2f%% maker=%.2f%% taker=%.2f%%",
-                 PAIR, TP_PCT*100, SL_PCT*100, FEE_MAKER*100, FEE_TAKER*100)
+        log.info("NEW SESSION | pairs=%s capital=£%.0f tp=±%.2f%% sl=±%.2f%%",
+                 ",".join(PAIRS), TOTAL_CAPITAL, TP_PCT*100, SL_PCT*100)
 
+        tick = 0
         while time.time() - start < SESSION_SEC:
-            try:
-                bid, ask, mid = get_prices(PAIR)
-            except Exception as exc:
-                log.warning("Price fetch failed: %s", exc)
-                time.sleep(POLL_SEC); continue
+            tick += 1
+            current_prices = {}
 
-            prices.append(mid)
-            move_pct = (mid - prices[-2]) / prices[-2] * 100 if len(prices) >= 2 else 0.0
+            for pair in PAIRS:
+                try:
+                    bid, ask, mid = fetch_prices(pair)
+                except Exception as exc:
+                    log.warning("%-8s price fetch failed: %s", pair, exc)
+                    continue
 
-            # ── Pending limit fills ────────────────────────────────────────────
-            if account.has_pending:
-                side = account.pending["side"]
-                if side == "long":
-                    account.try_fill_buy(bid, ask)
-                else:
-                    account.try_fill_short(bid, ask)
+                current_prices[pair] = mid
+                hist = price_history[pair]
+                hist.append(mid)
+                pos  = portfolio.positions.get(pair)
+                move = (mid - hist[-2]) / hist[-2] * 100 if len(hist) >= 2 else 0.0
 
-            # ── Manage open LONG ───────────────────────────────────────────────
-            elif account.in_long:
-                g = (mid - account.entry_price) / account.entry_price
-                if mid >= account.tp_target:
-                    account.close_long_limit(mid)
-                elif mid <= account.sl_level:
-                    account.close_long_market(mid, "STOP-LOSS↑ (market)")
-                elif len(prices) >= 3 and prices[-1] < prices[-2] < prices[-3]:
-                    if mid >= account.break_even:
-                        account.close_long_market(mid, "REVERSAL↓ (market)")
+                # ── Fill pending orders ────────────────────────────────────────
+                if pos and pos.has_pending:
+                    portfolio.try_fill(pair, bid, ask)
+                    pos = portfolio.positions.get(pair)
+
+                # ── Manage open position ───────────────────────────────────────
+                if pos and pos.in_position:
+                    gain = pos.current_gain(mid)
+                    tp   = pos.tp_target
+                    sl   = pos.sl_level
+                    be   = pos.break_even
+
+                    if (pos.direction == LONG  and mid >= tp) or \
+                       (pos.direction == SHORT and mid <= tp):
+                        portfolio.close_position(pair, tp, f"TAKE-PROFIT (limit)", LIMIT)
+
+                    elif (pos.direction == LONG  and mid <= sl) or \
+                         (pos.direction == SHORT and mid >= sl):
+                        portfolio.close_position(pair, mid, f"STOP-LOSS (market)", MARKET)
+
+                    elif len(hist) == 3:
+                        reversal = (hist[-1] < hist[-2] < hist[-3] if pos.direction == LONG
+                                    else hist[-1] > hist[-2] > hist[-3])
+                        if reversal and ((pos.direction == LONG  and mid >= be) or
+                                         (pos.direction == SHORT and mid <= be)):
+                            portfolio.close_position(pair, mid, "REVERSAL (market)", MARKET)
+                        elif not pos.pyramided and gain >= PYRAMID_TRIGGER:
+                            pyramid_price = bid if pos.direction == LONG else ask
+                            portfolio.place_pyramid(pair, pyramid_price)
+                        else:
+                            log.info("%-8s %s hold  gain=%+.3f%%  TP=£%.2f  SL=£%.2f%s",
+                                     pair, pos.direction, gain*100, tp, sl,
+                                     " [+pyramid pending]" if pos.has_pending else "")
                     else:
-                        log.info("tick=%-3d £%.2f %+.3f%% → LONG hold (%+.3f%% | TP=£%.2f)",
-                                 len(prices), mid, move_pct, g*100, account.tp_target)
-                else:
-                    log.info("tick=%-3d £%.2f %+.3f%% → LONG hold (%+.3f%%)",
-                             len(prices), mid, move_pct, g*100)
+                        log.info("%-8s %s hold  gain=%+.3f%%", pair, pos.direction, gain*100)
 
-            # ── Manage open SHORT ──────────────────────────────────────────────
-            elif account.in_short:
-                g = (account.entry_price - mid) / account.entry_price
-                if mid <= account.tp_target:
-                    account.close_short_limit(mid)
-                elif mid >= account.sl_level:
-                    account.close_short_market(mid, "STOP-LOSS↓ (market)")
-                elif len(prices) >= 3 and prices[-1] > prices[-2] > prices[-3]:
-                    if mid <= account.break_even:
-                        account.close_short_market(mid, "REVERSAL↑ (market)")
+                # ── Entry signals ──────────────────────────────────────────────
+                elif pos is None or not pos.has_pending:
+                    if len(hist) == 3:
+                        cum_up = (hist[-1] - hist[-3]) / hist[-3]
+                        cum_dn = (hist[-3] - hist[-1]) / hist[-3]
+                        up = hist[-1] > hist[-2] > hist[-3]
+                        dn = hist[-1] < hist[-2] < hist[-3]
+
+                        if up and cum_up >= MOMENTUM_MIN:
+                            portfolio.place_entry(pair, LONG, bid)
+                        elif dn and cum_dn >= MOMENTUM_MIN:
+                            portfolio.place_entry(pair, SHORT, ask)
+                        else:
+                            log.info("%-8s watch  £%.2f  %+.3f%%", pair, mid, move)
                     else:
-                        log.info("tick=%-3d £%.2f %+.3f%% → SHORT hold (%+.3f%% | TP=£%.2f)",
-                                 len(prices), mid, move_pct, g*100, account.tp_target)
-                else:
-                    log.info("tick=%-3d £%.2f %+.3f%% → SHORT hold (%+.3f%%)",
-                             len(prices), mid, move_pct, g*100)
+                        log.info("%-8s baseline £%.2f", pair, mid)
 
-            # ── Entry signals ──────────────────────────────────────────────────
-            elif len(prices) >= 3:
-                up1   = prices[-1] > prices[-2]; up2   = prices[-2] > prices[-3]
-                dn1   = prices[-1] < prices[-2]; dn2   = prices[-2] < prices[-3]
-                cum_u = (prices[-1] - prices[-3]) / prices[-3]
-                cum_d = (prices[-3] - prices[-1]) / prices[-3]
-
-                if up1 and up2 and cum_u >= MOMENTUM_MIN:
-                    account.place_limit_buy(bid)
-                elif dn1 and dn2 and cum_d >= MOMENTUM_MIN:
-                    account.place_limit_short(ask)
-                else:
-                    reason = ("not sustained" if not ((up1 and up2) or (dn1 and dn2))
-                              else f"move {max(cum_u,cum_d)*100:.3f}% < min")
-                    log.info("tick=%-3d £%.2f %+.3f%% → no entry (%s)",
-                             len(prices), mid, move_pct, reason)
-            else:
-                log.info("tick=%-3d £%.2f → collecting baseline...", len(prices), mid)
-
-            # ── Sync shared state ──────────────────────────────────────────────
-            pv          = account.portfolio_value(mid)
-            gain        = account.current_gain(mid)
-            session_pnl = sum(t["net_pnl"] for t in account.trades
-                              if t["net_pnl"] is not None)
-            total_fees  = sum(t["fee"] for t in account.trades)
-            longs       = sum(1 for t in account.trades
-                              if t["direction"] == "LONG" and t["side"] == "SELL")
-            shorts      = sum(1 for t in account.trades
-                              if t["direction"] == "SHORT" and t["side"] == "BUY")
+            # ── Sync shared state (only trades list updated on change) ─────────
+            pv = portfolio.portfolio_value(current_prices)
+            pos_snapshot = {
+                pair: {
+                    "direction":  pos.direction,
+                    "in_position":pos.in_position,
+                    "has_pending":pos.has_pending,
+                    "pyramided":  pos.pyramided,
+                    "avg_entry":  round(pos.avg_entry, 2),
+                    "tp_target":  pos.tp_target,
+                    "sl_level":   pos.sl_level,
+                    "gain_pct":   round(pos.current_gain(current_prices[pair]) * 100, 3)
+                                  if pos.in_position and pair in current_prices else None,
+                    "price":      current_prices.get(pair),
+                    "pending_price": pos.pending["limit"] if pos.has_pending else None,
+                }
+                for pair, pos in portfolio.positions.items()
+                if pos.in_position or pos.has_pending
+            }
 
             with state_lock:
-                state.update(
-                    tick=len(prices), last_price=mid, last_bid=bid, last_ask=ask,
-                    position_type=account.position_type,
-                    entry_price=account.entry_price,
-                    tp_target=account.tp_target,
-                    sl_level=account.sl_level,
-                    current_gain_pct=gain,
-                    pending_order=account.pending,
-                    cash=round(account.cash, 2), btc=account.btc,
-                    portfolio_value=round(pv, 2),
-                    trades=list(account.trades),
-                    session_pnl=round(session_pnl, 4),
-                    total_fees=round(total_fees, 4),
-                    long_trades=longs, short_trades=shorts,
-                    status=("long 📈" if account.in_long
-                            else "short 📉" if account.in_short
-                            else "pending..." if account.has_pending
-                            else "watching"),
-                )
+                trades_changed = len(portfolio.trades) != trades_version
+                state_update(state,
+                             tick=tick,
+                             prices=dict(current_prices),
+                             positions=pos_snapshot,
+                             portfolio_value=round(pv, 2),
+                             cash=round(portfolio.cash, 2),
+                             session_pnl=round(portfolio.session_pnl, 4),
+                             total_fees=round(portfolio.total_fees, 4),
+                             long_count=portfolio.long_count,
+                             short_count=portfolio.short_count,
+                             status=_bot_status(portfolio),
+                             **({'trades': list(portfolio.trades)} if trades_changed else {}))
+                if trades_changed:
+                    trades_version = len(portfolio.trades)
 
-            if len(prices) > 100: prices = prices[-50:]
             time.sleep(POLL_SEC)
 
-        # ── Session end — close any open position ──────────────────────────────
-        account.pending = None
-        if account.in_long:
-            _, _, mid = get_prices(PAIR)
-            account.close_long_market(mid, "SESSION-END (market)")
-        elif account.in_short:
-            _, _, mid = get_prices(PAIR)
-            account.close_short_market(mid, "SESSION-END (market)")
+        # ── Session end: close all positions ───────────────────────────────────
+        for pair in list(portfolio.positions):
+            pos = portfolio.positions.get(pair)
+            if pos and pos.in_position:
+                try:
+                    _, _, mid = fetch_prices(pair)
+                    portfolio.close_position(pair, mid, "SESSION-END (market)", MARKET)
+                except Exception as exc:
+                    log.warning("%-8s session-end close failed: %s", pair, exc)
 
-        log.info("Session complete. Restarting in 30s...")
-        with state_lock: state["status"] = "restarting..."
+        log.info("Session complete | pnl=£%+.2f fees=£%.2f longs=%d shorts=%d. Restarting in 30s...",
+                 portfolio.session_pnl, portfolio.total_fees,
+                 portfolio.long_count, portfolio.short_count)
+        with state_lock: state_update(state, status="restarting...")
         time.sleep(30)
 
+def _bot_status(portfolio: Portfolio) -> str:
+    active = [(p, pos.direction) for p, pos in portfolio.positions.items() if pos.in_position]
+    if not active: return "watching"
+    return " | ".join(f"{p} {'📈' if d==LONG else '📉'}" for p, d in active)
+
 # ── Status page ───────────────────────────────────────────────────────────────
-def render_html(s):
+_html_cache    = ""
+_html_dirty    = True
+_html_lock     = threading.Lock()
+
+def _mark_dirty():
+    global _html_dirty
+    with _html_lock: _html_dirty = True
+
+def render_html(s: dict) -> str:
+    # ── Per-pair position cards ──────────────────────────────────────────────
+    pair_cards = ""
+    all_pairs  = PAIRS + [p for p in s["positions"] if p not in PAIRS]
+    for pair in all_pairs:
+        pos   = s["positions"].get(pair)
+        price = s["prices"].get(pair)
+        if price is None and pos is None: continue
+
+        price_str = f"£{price:,.2f}" if price else "—"
+        if pos:
+            d         = pos["direction"]
+            d_col     = "#2ecc71" if d == LONG else "#e74c3c"
+            gain      = pos.get("gain_pct")
+            gain_str  = f"{gain:+.3f}%" if gain is not None else "—"
+            gain_col  = "#2ecc71" if (gain or 0) > 0 else "#e74c3c"
+            tp_str    = f"£{pos['tp_target']:,.2f}" if pos["tp_target"] else "—"
+            sl_str    = f"£{pos['sl_level']:,.2f}"  if pos["sl_level"]  else "—"
+            pend_str  = f"£{pos['pending_price']:,.2f}" if pos["pending_price"] else ""
+            pyra_badge= ' <span style="color:#f39c12;font-size:10px">+PYRAMID</span>' if pos["pyramided"] else ""
+            status_lbl= f'{d} ▲{pyra_badge}' if d == LONG else f'{d} ▼{pyra_badge}'
+            if pos["has_pending"] and not pos["in_position"]:
+                status_lbl = f'PENDING {d} @ {pend_str}'
+                d_col = "#f39c12"
+        else:
+            d_col = gain_col = "#444"
+            gain_str = tp_str = sl_str = "—"
+            status_lbl = "FLAT"
+
+        pair_cards += f"""
+        <div class="card" style="border-color:{'#1e3a1e' if pos and pos.get('direction')==LONG else '#3a1e1e' if pos and pos.get('direction')==SHORT else '#1c1c38'}">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+            <span style="color:#e2b96f;font-weight:bold">{pair}</span>
+            <span style="color:{d_col};font-size:12px">{status_lbl}</span>
+          </div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:4px;font-size:12px">
+            <span style="color:#555">Price</span>   <span>{price_str}</span>
+            <span style="color:#555">Gain</span>    <span style="color:{gain_col}">{gain_str}</span>
+            <span style="color:#555">TP</span>      <span style="color:#2ecc71">{tp_str}</span>
+            <span style="color:#555">SL</span>      <span style="color:#e74c3c">{sl_str}</span>
+          </div>
+        </div>"""
+
+    # ── Trade log rows ────────────────────────────────────────────────────────
     rows = ""
     for t in reversed(s["trades"]):
-        is_open  = t["net_pnl"] is None
-        pnl_str  = f"£{t['net_pnl']:+.4f}" if not is_open else "open"
-        pnl_col  = ("#2ecc71" if (t["net_pnl"] or 0) > 0
-                    else "#e74c3c" if (t["net_pnl"] or 0) < 0 else "#888")
-        dir_col  = "#2ecc71" if t["direction"] == "LONG" else "#e74c3c"
-        badge    = (f'<span style="font-size:10px;padding:2px 5px;border-radius:3px;'
-                    f'background:{"#1a3a1a" if t["direction"]=="LONG" else "#3a1a1a"};'
-                    f'color:{dir_col}">{t["direction"]}</span>')
-        rows += f"""<tr>
+        pnl     = t.get("net_pnl")
+        pnl_str = f"£{pnl:+.4f}" if pnl is not None else "open"
+        pnl_col = "#2ecc71" if (pnl or 0) > 0 else "#e74c3c" if (pnl or 0) < 0 else "#888"
+        d_col   = "#2ecc71" if t["direction"] == LONG else "#e74c3c"
+        pyra    = ' <span style="color:#f39c12;font-size:9px">PYR</span>' if t.get("is_pyramid") else ""
+        rows   += f"""<tr>
           <td>{t['time']}</td>
-          <td>{t['side']} {badge}</td>
-          <td style="font-size:10px;color:#555">{t.get('order','')}</td>
+          <td style="color:{d_col}">{t['pair']}</td>
+          <td>{t['side']}{pyra}</td>
+          <td style="font-size:10px;color:#555">{t['order']}</td>
           <td>£{t['price']:,.2f}</td>
           <td>{t['volume']:.5f}</td>
           <td>£{t['fee']:.4f}</td>
           <td style="color:{pnl_col};font-weight:bold">{pnl_str}</td>
-          <td style="font-size:11px;color:#666">{t['reason']}</td>
+          <td style="font-size:11px;color:#555">{t['reason']}</td>
         </tr>"""
 
-    pnl      = s["session_pnl"]
-    pnl_col  = "#2ecc71" if pnl >= 0 else "#e74c3c"
-    pt       = s.get("position_type")
-    pos_col  = "#2ecc71" if pt == "long" else "#e74c3c" if pt == "short" else (
-               "#f39c12" if s["pending_order"] else "#444")
-    gain_str = f"{s['current_gain_pct']:+.3f}%" if s["current_gain_pct"] is not None else "—"
-    tp_str   = f"£{s['tp_target']:,.2f}" if s["tp_target"] else "—"
-    sl_str   = f"£{s['sl_level']:,.2f}"  if s["sl_level"]  else "—"
-    pend_str = (f"£{s['pending_order']['limit']:,.2f} ({s['pending_order']['side'].upper()})"
-                if s["pending_order"] else "—")
-    spread   = ((s["last_ask"] - s["last_bid"]) / s["last_bid"] * 100) if s["last_bid"] else 0
-    pv_diff  = s["portfolio_value"] - START_GBP
-    pv_col   = "#2ecc71" if pv_diff >= 0 else "#e74c3c"
+    pnl     = s["session_pnl"]
+    pv      = s["portfolio_value"]
+    pv_diff = pv - TOTAL_CAPITAL
+    pnl_col = "#2ecc71" if pnl >= 0  else "#e74c3c"
+    pv_col  = "#2ecc71" if pv_diff >= 0 else "#e74c3c"
 
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="utf-8">
   <meta http-equiv="refresh" content="15">
-  <title>{s['pair']} Bot</title>
+  <title>Momentum Bot</title>
   <style>
-    *     {{ box-sizing:border-box;margin:0;padding:0 }}
-    body  {{ font-family:'Courier New',monospace;background:#0b0b18;color:#ccc;padding:24px }}
-    h1    {{ color:#e2b96f;font-size:20px;margin-bottom:4px }}
-    .sub  {{ color:#444;font-size:12px;margin-bottom:22px }}
-    .grid {{ display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:10px;margin-bottom:22px }}
-    .card {{ background:#111128;border:1px solid #1c1c38;border-radius:8px;padding:14px }}
-    .lbl  {{ color:#444;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:5px }}
-    .val  {{ font-size:18px;font-weight:bold }}
-    .section {{ margin-bottom:10px;color:#e2b96f;font-size:11px;text-transform:uppercase;letter-spacing:2px }}
-    table {{ width:100%;border-collapse:collapse;background:#111128;border:1px solid #1c1c38;border-radius:8px;overflow:hidden }}
-    th    {{ background:#090916;padding:9px 11px;text-align:left;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:1px }}
-    td    {{ padding:8px 11px;border-bottom:1px solid #161630;font-size:12px }}
-    tr:last-child td {{ border:none }}
-    .pulse{{ animation:pulse 2s infinite }}
-    @keyframes pulse{{ 0%,100%{{opacity:1}}50%{{opacity:.3}} }}
+    *    {{ box-sizing:border-box;margin:0;padding:0 }}
+    body {{ font-family:'Courier New',monospace;background:#0b0b18;color:#ccc;padding:24px }}
+    h1   {{ color:#e2b96f;font-size:20px;margin-bottom:4px }}
+    .sub {{ color:#444;font-size:12px;margin-bottom:20px }}
+    .sec {{ color:#e2b96f;font-size:10px;text-transform:uppercase;letter-spacing:2px;margin:18px 0 8px }}
+    .grid{{ display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px }}
+    .pgrid{{ display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px }}
+    .card{{ background:#111128;border:1px solid #1c1c38;border-radius:8px;padding:14px }}
+    .lbl {{ color:#444;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px }}
+    .val {{ font-size:18px;font-weight:bold }}
+    table{{ width:100%;border-collapse:collapse;background:#111128;border:1px solid #1c1c38;border-radius:8px;overflow:hidden }}
+    th   {{ background:#090916;padding:8px 10px;text-align:left;font-size:10px;color:#444;text-transform:uppercase }}
+    td   {{ padding:7px 10px;border-bottom:1px solid #161630;font-size:12px }}
+    tr:last-child td{{ border:none }}
+    .dot {{ animation:pulse 2s infinite }}
+    @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
   </style>
 </head>
 <body>
-  <h1>📈📉 {s['pair']} Momentum Bot — Long &amp; Short</h1>
+  <h1>📈📉 Multi-Pair Momentum Bot</h1>
   <div class="sub">
-    Kraken Pro · Limit orders · maker {FEE_MAKER*100:.2f}% taker {FEE_TAKER*100:.2f}% margin {MARGIN_OPEN*100:.2f}% open +{MARGIN_4H*100:.2f}%/4h &nbsp;·&nbsp;
-    Bid £{s['last_bid']:,.2f} / Ask £{s['last_ask']:,.2f} / Spread {spread:.4f}% &nbsp;·&nbsp;
-    <span style="color:{pos_col}" class="pulse">● {s['status']}</span>
+    {",".join(PAIRS)} &nbsp;·&nbsp; Kraken Pro · maker {FEE_MAKER*100:.2f}% taker {FEE_TAKER*100:.2f}% margin {MARGIN_OPEN*100:.2f}%+{MARGIN_4H*100:.2f}%/4h
+    &nbsp;·&nbsp; tick #{s['tick']} &nbsp;·&nbsp;
+    <span class="dot">● {s['status']}</span>
   </div>
 
-  <div class="section">Performance</div>
-  <div class="grid" style="margin-top:8px">
-    <div class="card"><div class="lbl">Last Price</div><div class="val">£{s['last_price']:,.2f}</div></div>
-    <div class="card"><div class="lbl">Portfolio Value</div><div class="val" style="color:{pv_col}">£{s['portfolio_value']:,.2f}</div></div>
+  <div class="sec">Portfolio</div>
+  <div class="grid">
+    <div class="card"><div class="lbl">Value</div><div class="val" style="color:{pv_col}">£{pv:,.2f}</div></div>
+    <div class="card"><div class="lbl">Cash</div><div class="val">£{s['cash']:,.2f}</div></div>
     <div class="card"><div class="lbl">Session P&amp;L</div><div class="val" style="color:{pnl_col}">£{pnl:+.2f}</div></div>
     <div class="card"><div class="lbl">Total Fees</div><div class="val" style="color:#e67e22">£{s['total_fees']:.2f}</div></div>
-    <div class="card"><div class="lbl">Long Closes</div><div class="val" style="color:#2ecc71">{s['long_trades']}</div></div>
-    <div class="card"><div class="lbl">Short Closes</div><div class="val" style="color:#e74c3c">{s['short_trades']}</div></div>
-    <div class="card"><div class="lbl">Cash</div><div class="val">£{s['cash']:,.2f}</div></div>
-    <div class="card"><div class="lbl">Tick</div><div class="val">#{s['tick']}</div></div>
+    <div class="card"><div class="lbl">Long closes</div><div class="val" style="color:#2ecc71">{s['long_count']}</div></div>
+    <div class="card"><div class="lbl">Short closes</div><div class="val" style="color:#e74c3c">{s['short_count']}</div></div>
   </div>
 
-  <div class="section" style="margin-top:18px">Position</div>
-  <div class="grid" style="margin-top:8px">
-    <div class="card"><div class="lbl">Direction</div>
-      <div class="val" style="color:{pos_col}">
-        {('LONG ▲' if pt=='long' else 'SHORT ▼' if pt=='short' else 'FLAT')}
-      </div>
-    </div>
-    <div class="card"><div class="lbl">Unrealised Gain</div><div class="val" style="color:{pos_col}">{gain_str}</div></div>
-    <div class="card"><div class="lbl">Entry Price</div><div class="val">{"£{:,.2f}".format(s['entry_price']) if s['entry_price'] else '—'}</div></div>
-    <div class="card"><div class="lbl">TP Target</div><div class="val" style="color:#2ecc71">{tp_str}</div></div>
-    <div class="card"><div class="lbl">Stop Loss</div><div class="val" style="color:#e74c3c">{sl_str}</div></div>
-    <div class="card"><div class="lbl">Pending Order</div><div class="val" style="color:#f39c12;font-size:14px">{pend_str}</div></div>
-  </div>
+  <div class="sec">Positions</div>
+  <div class="pgrid">{pair_cards}</div>
 
-  <div class="section" style="margin-top:18px">Trade Log</div>
-  <table style="margin-top:8px">
-    <tr><th>Time</th><th>Side</th><th>Order</th><th>Price</th><th>Volume</th><th>Fee</th><th>Net P&amp;L</th><th>Reason</th></tr>
-    {"".join(rows) or "<tr><td colspan='8' style='text-align:center;color:#333;padding:20px'>No trades yet</td></tr>"}
+  <div class="sec">Trade Log</div>
+  <table>
+    <tr><th>Time</th><th>Pair</th><th>Side</th><th>Order</th><th>Price</th><th>Vol</th><th>Fee</th><th>P&amp;L</th><th>Reason</th></tr>
+    {"".join(rows) or "<tr><td colspan='9' style='text-align:center;color:#333;padding:20px'>No trades yet</td></tr>"}
   </table>
 </body>
 </html>"""
 
 class StatusHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        with state_lock: s = dict(state)
-        html = (render_html(s) if s["last_price"]
-                else "<html><body style='background:#0b0b18;color:#eee;font-family:monospace;padding:30px'><h2>⏳ Starting...</h2></body></html>")
+        global _html_cache, _html_dirty
+        with _html_lock:
+            dirty = _html_dirty
+        if dirty:
+            with state_lock: s = dict(state)
+            html = render_html(s) if s["prices"] else \
+                   "<html><body style='background:#0b0b18;color:#eee;font-family:monospace;padding:30px'><h2>⏳ Starting...</h2></body></html>"
+            with _html_lock:
+                _html_cache = html
+                _html_dirty = False
+        else:
+            with _html_lock: html = _html_cache
+
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
@@ -511,9 +589,14 @@ class StatusHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *args): pass
 
+def state_update(d: dict, **kw):
+    """Update state dict and mark HTML cache dirty."""
+    d.update(kw)
+    _mark_dirty()
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("Starting | pair=%s port=%d long+short enabled", PAIR, PORT)
+    log.info("Starting | pairs=%s port=%d capital=£%.0f", ",".join(PAIRS), PORT, TOTAL_CAPITAL)
     threading.Thread(target=run_bot, daemon=True).start()
     log.info("Status page → http://0.0.0.0:%d", PORT)
     HTTPServer(("0.0.0.0", PORT), StatusHandler).serve_forever()
