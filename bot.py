@@ -36,16 +36,17 @@ SESSION_SEC     = int(os.getenv("SESSION_SEC", "86400"))
 TOTAL_CAPITAL   = float(os.getenv("TOTAL_CAPITAL", "10000"))
 INITIAL_FRAC    = float(os.getenv("INITIAL_FRAC",  "0.25"))    # 25% per initial entry
 PYRAMID_FRAC    = float(os.getenv("PYRAMID_FRAC",  "0.08"))    # 8% pyramid add
-PYRAMID_TRIGGER = float(os.getenv("PYRAMID_TRIGGER","0.0025")) # add when gain > 0.25%
+PYRAMID_TRIGGER = float(os.getenv("PYRAMID_TRIGGER","0.0040")) # add when gain > 0.40% (was 0.25%)
 RESERVE_MIN     = float(os.getenv("RESERVE_MIN",   "500"))     # always keep £500 free
-MAX_SAME_DIR    = int(os.getenv("MAX_SAME_DIR",    "2"))       # max pairs per direction
+MAX_SAME_DIR    = int(os.getenv("MAX_SAME_DIR",    "1"))       # max pairs per direction (was 2)
 FEE_MAKER       = float(os.getenv("FEE_MAKER",  "0.0014"))
 FEE_TAKER       = float(os.getenv("FEE_TAKER",  "0.0024"))
 MARGIN_OPEN     = float(os.getenv("MARGIN_OPEN","0.0002"))
 MARGIN_4H       = float(os.getenv("MARGIN_4H",  "0.0002"))
-TP_PCT          = float(os.getenv("TP_PCT",  "0.0050"))
+TP_PCT          = float(os.getenv("TP_PCT",  "0.0080"))        # +0.80% take-profit (was 0.50%)
 SL_PCT          = float(os.getenv("SL_PCT",  "0.0030"))
-MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0002"))
+MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0005"))    # 0.05% min move (was 0.02%)
+SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "5"))         # ticks to wait after a stop-loss
 LIMIT_EXPIRY    = int(os.getenv("LIMIT_EXPIRY",  "3"))
 PORT            = int(os.getenv("PORT", "8080"))
 KRAKEN_API      = "https://api.kraken.com/0/public"
@@ -292,6 +293,7 @@ def run_bot():
     while True:
         portfolio     = Portfolio()
         price_history = {p: deque(maxlen=3) for p in PAIRS}  # only last 3 needed
+        sl_cooldown   = {p: 0 for p in PAIRS}               # ticks remaining before re-entry allowed
         start         = time.time()
 
         with state_lock:
@@ -341,6 +343,8 @@ def run_bot():
                     elif (pos.direction == LONG  and mid <= sl) or \
                          (pos.direction == SHORT and mid >= sl):
                         portfolio.close_position(pair, mid, f"STOP-LOSS (market)", MARKET)
+                        sl_cooldown[pair] = SL_COOLDOWN
+                        log.info("%-8s cooldown %d ticks before re-entry", pair, SL_COOLDOWN)
 
                     elif len(hist) == 3:
                         reversal = (hist[-1] < hist[-2] < hist[-3] if pos.direction == LONG
@@ -360,7 +364,10 @@ def run_bot():
 
                 # ── Entry signals ──────────────────────────────────────────────
                 elif pos is None or not pos.has_pending:
-                    if len(hist) == 3:
+                    if sl_cooldown[pair] > 0:
+                        sl_cooldown[pair] -= 1
+                        log.info("%-8s cooldown £%.2f  (%d ticks left)", pair, mid, sl_cooldown[pair])
+                    elif len(hist) == 3:
                         cum_up = (hist[-1] - hist[-3]) / hist[-3]
                         cum_dn = (hist[-3] - hist[-1]) / hist[-3]
                         up = hist[-1] > hist[-2] > hist[-3]
