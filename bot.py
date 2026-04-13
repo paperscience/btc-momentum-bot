@@ -494,24 +494,74 @@ def render_html(s: dict) -> str:
           </div>
         </div>"""
 
-    # ── Trade log rows ────────────────────────────────────────────────────────
+    # ── Build matched round-trips ─────────────────────────────────────────────
+    # Group trades into open→close pairs per pair symbol
+    rounds = []
+    open_entries: dict = {}   # pair → [entry trade, ...]
+    for t in s["trades"]:
+        pair = t["pair"]
+        if t.get("net_pnl") is None:          # entry (open)
+            open_entries.setdefault(pair, []).append(t)
+        else:                                  # close
+            entries = open_entries.pop(pair, [])
+            rounds.append({"entries": entries, "close": t})
+    # Any still-open positions
+    for pair, entries in open_entries.items():
+        if entries:
+            rounds.append({"entries": entries, "close": None})
+
     rows = ""
-    for t in reversed(s["trades"]):
-        pnl     = t.get("net_pnl")
-        pnl_str = f"£{pnl:+.4f}" if pnl is not None else "open"
-        pnl_col = "#2ecc71" if (pnl or 0) > 0 else "#e74c3c" if (pnl or 0) < 0 else "#888"
-        d_col   = "#2ecc71" if t["direction"] == LONG else "#e74c3c"
-        pyra    = ' <span style="color:#f39c12;font-size:9px">PYR</span>' if t.get("is_pyramid") else ""
-        rows   += f"""<tr>
-          <td>{t['time']}</td>
-          <td style="color:{d_col}">{t['pair']}</td>
-          <td>{t['side']}{pyra}</td>
-          <td style="font-size:10px;color:#555">{t['order']}</td>
-          <td>£{t['price']:,.2f}</td>
-          <td>{t['volume']:.5f}</td>
-          <td>£{t['fee']:.4f}</td>
-          <td style="color:{pnl_col};font-weight:bold">{pnl_str}</td>
-          <td style="font-size:11px;color:#555">{t['reason']}</td>
+    for i, r in enumerate(reversed(rounds), 1):
+        entries = r["entries"]
+        close   = r["close"]
+        if not entries and not close:
+            continue
+
+        # Representative entry for pair/direction
+        rep      = entries[0] if entries else close
+        pair     = rep["pair"]
+        dirn     = rep["direction"]
+        d_col    = "#2ecc71" if dirn == LONG else "#e74c3c"
+        dir_icon = "📈" if dirn == LONG else "📉"
+
+        # Entry cell
+        if entries:
+            base_e   = entries[0]
+            entry_td = f'{base_e["time"]} &nbsp; £{base_e["price"]:,.2f}'
+            if len(entries) > 1:   # pyramided
+                pyr_prices = " ".join(f'£{e["price"]:,.2f}' for e in entries[1:])
+                entry_td  += f'<br><span style="color:#f39c12;font-size:10px">+PYR {pyr_prices}</span>'
+            total_fee = sum(e["fee"] for e in entries)
+            if close:
+                total_fee += close["fee"]
+        else:
+            entry_td  = '<span style="color:#555">—</span>'
+            total_fee = close["fee"] if close else 0.0
+
+        # Close cell
+        if close:
+            reason    = close["reason"].split(" (")[0]   # trim "(market)" etc.
+            reason_col = ("#2ecc71" if "TAKE-PROFIT" in reason
+                          else "#e74c3c" if "STOP-LOSS" in reason
+                          else "#888")
+            close_td  = (f'{close["time"]} &nbsp; £{close["price"]:,.2f}'
+                         f'<br><span style="font-size:10px;color:{reason_col}">{reason}</span>')
+            pnl       = close["net_pnl"]
+            pnl_str   = f"£{pnl:+.4f}"
+            pnl_col   = "#2ecc71" if pnl > 0 else "#e74c3c" if pnl < 0 else "#888"
+        else:
+            close_td  = '<span style="color:#f39c12;font-size:11px">● OPEN</span>'
+            pnl_str   = "—"
+            pnl_col   = "#888"
+
+        rows += f"""<tr>
+          <td style="color:#555;font-size:11px">{len(rounds)-i+1}</td>
+          <td><span style="color:{d_col};font-weight:bold">{pair}</span>
+              <span style="font-size:10px;margin-left:4px">{dir_icon}</span></td>
+          <td style="line-height:1.6">{entry_td}</td>
+          <td style="line-height:1.6">{close_td}</td>
+          <td style="color:#555;font-size:11px">£{total_fee:.4f}</td>
+          <td style="color:{pnl_col};font-weight:bold;font-size:14px">{pnl_str}</td>
         </tr>"""
 
     pnl     = s["session_pnl"]
@@ -538,9 +588,10 @@ def render_html(s: dict) -> str:
     .lbl {{ color:#444;font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:4px }}
     .val {{ font-size:18px;font-weight:bold }}
     table{{ width:100%;border-collapse:collapse;background:#111128;border:1px solid #1c1c38;border-radius:8px;overflow:hidden }}
-    th   {{ background:#090916;padding:8px 10px;text-align:left;font-size:10px;color:#444;text-transform:uppercase }}
-    td   {{ padding:7px 10px;border-bottom:1px solid #161630;font-size:12px }}
+    th   {{ background:#090916;padding:8px 10px;text-align:left;font-size:10px;color:#444;text-transform:uppercase;letter-spacing:1px }}
+    td   {{ padding:9px 10px;border-bottom:1px solid #161630;font-size:12px;vertical-align:top }}
     tr:last-child td{{ border:none }}
+    tr:hover td{{ background:#13132a }}
     .dot {{ animation:pulse 2s infinite }}
     @keyframes pulse{{0%,100%{{opacity:1}}50%{{opacity:.3}}}}
   </style>
@@ -568,8 +619,8 @@ def render_html(s: dict) -> str:
 
   <div class="sec">Trade Log</div>
   <table>
-    <tr><th>Time</th><th>Pair</th><th>Side</th><th>Order</th><th>Price</th><th>Vol</th><th>Fee</th><th>P&amp;L</th><th>Reason</th></tr>
-    {"".join(rows) or "<tr><td colspan='9' style='text-align:center;color:#333;padding:20px'>No trades yet</td></tr>"}
+    <tr><th>#</th><th>Pair</th><th>Entry</th><th>Exit</th><th>Fees</th><th>P&amp;L</th></tr>
+    {"".join(rows) or "<tr><td colspan='6' style='text-align:center;color:#333;padding:20px'>No trades yet</td></tr>"}
   </table>
 </body>
 </html>"""
