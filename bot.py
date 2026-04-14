@@ -43,9 +43,10 @@ FEE_MAKER       = float(os.getenv("FEE_MAKER",  "0.0014"))
 FEE_TAKER       = float(os.getenv("FEE_TAKER",  "0.0024"))
 MARGIN_OPEN     = float(os.getenv("MARGIN_OPEN","0.0002"))
 MARGIN_4H       = float(os.getenv("MARGIN_4H",  "0.0002"))
-TP_PCT          = float(os.getenv("TP_PCT",  "0.0150"))        # 1.50% take-profit (was 0.80% — wider to maintain 2.5:1 ratio)
-SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss (was 0.30% — stop whipsaw exits)
+TP_PCT          = float(os.getenv("TP_PCT",  "0.0045"))        # 0.45% take-profit — matches observed market swing distance before reversal
+SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss — wider than TP to allow breathing room
 MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0008"))    # 0.08% min move (was 0.05% — higher conviction entries)
+TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "40"))        # EMA length for trend filter (40 ticks ≈ 10 min)
 SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "5"))         # ticks to wait after a stop-loss
 LIMIT_EXPIRY    = int(os.getenv("LIMIT_EXPIRY",  "3"))
 PORT            = int(os.getenv("PORT", "8080"))
@@ -294,6 +295,7 @@ def run_bot():
         portfolio     = Portfolio()
         price_history = {p: deque(maxlen=3) for p in PAIRS}  # only last 3 needed
         sl_cooldown   = {p: 0 for p in PAIRS}               # ticks remaining before re-entry allowed
+        trend_ema     = {p: None for p in PAIRS}             # EMA of mid prices for trend filter
         start         = time.time()
 
         with state_lock:
@@ -321,6 +323,9 @@ def run_bot():
                 current_prices[pair] = mid
                 hist = price_history[pair]
                 hist.append(mid)
+                # Update EMA for trend filter
+                k = 2 / (TREND_EMA_LEN + 1)
+                trend_ema[pair] = mid if trend_ema[pair] is None else mid * k + trend_ema[pair] * (1 - k)
                 pos  = portfolio.positions.get(pair)
                 move = (mid - hist[-2]) / hist[-2] * 100 if len(hist) >= 2 else 0.0
 
@@ -372,11 +377,18 @@ def run_bot():
                         cum_dn = (hist[-3] - hist[-1]) / hist[-3]
                         up = hist[-1] > hist[-2] > hist[-3]
                         dn = hist[-1] < hist[-2] < hist[-3]
+                        ema  = trend_ema[pair]
+                        # Trend filter: only trade with the EMA direction
+                        with_trend_long  = ema is None or mid > ema
+                        with_trend_short = ema is None or mid < ema
 
-                        if up and cum_up >= MOMENTUM_MIN:
+                        if up and cum_up >= MOMENTUM_MIN and with_trend_long:
                             portfolio.place_entry(pair, LONG, bid)
-                        elif dn and cum_dn >= MOMENTUM_MIN:
+                        elif dn and cum_dn >= MOMENTUM_MIN and with_trend_short:
                             portfolio.place_entry(pair, SHORT, ask)
+                        elif (up and cum_up >= MOMENTUM_MIN) or (dn and cum_dn >= MOMENTUM_MIN):
+                            log.info("%-8s SKIP %s — counter-trend (mid=£%.2f ema=£%.2f)",
+                                     pair, LONG if up else SHORT, mid, ema or 0)
                         else:
                             log.info("%-8s watch  £%.2f  %+.3f%%", pair, mid, move)
                     else:
