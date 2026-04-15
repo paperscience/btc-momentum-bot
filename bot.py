@@ -46,7 +46,9 @@ MARGIN_4H       = float(os.getenv("MARGIN_4H",  "0.0002"))
 TP_PCT          = float(os.getenv("TP_PCT",  "0.0100"))        # 1.00% take-profit — viable on 60s polls where market sustains larger moves
 SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss
 MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0008"))    # 0.08% min move (was 0.05% — higher conviction entries)
-TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "40"))        # EMA length for trend filter (40 ticks ≈ 10 min)
+TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "40"))        # EMA length for trend filter (40 ticks ≈ 40 min at 60s)
+TRAIL_TRIGGER   = float(os.getenv("TRAIL_TRIGGER", "0.0050"))  # activate trailing stop once gain > 0.50%
+TRAIL_DIST      = float(os.getenv("TRAIL_DIST",    "0.0030"))  # trail 0.30% below peak gain
 SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "5"))         # ticks to wait after a stop-loss
 LIMIT_EXPIRY    = int(os.getenv("LIMIT_EXPIRY",  "3"))
 PORT            = int(os.getenv("PORT", "8080"))
@@ -95,6 +97,7 @@ class Position:
     direction: str
     tranches:  list  = field(default_factory=list)
     pending:   Optional[dict] = None
+    peak_gain: float = 0.0   # highest gain seen — used for trailing stop
 
     @property
     def in_position(self) -> bool: return bool(self.tranches)
@@ -351,21 +354,25 @@ def run_bot():
                         sl_cooldown[pair] = SL_COOLDOWN
                         log.info("%-8s cooldown %d ticks before re-entry", pair, SL_COOLDOWN)
 
-                    elif len(hist) == 3:
-                        reversal = (hist[-1] < hist[-2] < hist[-3] if pos.direction == LONG
-                                    else hist[-1] > hist[-2] > hist[-3])
-                        if reversal and ((pos.direction == LONG  and mid >= be) or
-                                         (pos.direction == SHORT and mid <= be)):
-                            portfolio.close_position(pair, mid, "REVERSAL (market)", MARKET)
+                    else:
+                        # Update peak gain for trailing stop
+                        if gain > pos.peak_gain:
+                            pos.peak_gain = gain
+                        # Trailing stop: once gain > TRAIL_TRIGGER, exit if gain drops
+                        # more than TRAIL_DIST below the peak
+                        if (pos.peak_gain >= TRAIL_TRIGGER and
+                                gain <= pos.peak_gain - TRAIL_DIST):
+                            portfolio.close_position(pair, mid, "TRAIL-STOP (market)", MARKET)
                         elif not pos.pyramided and gain >= PYRAMID_TRIGGER:
                             pyramid_price = bid if pos.direction == LONG else ask
                             portfolio.place_pyramid(pair, pyramid_price)
                         else:
-                            log.info("%-8s %s hold  gain=%+.3f%%  TP=£%.2f  SL=£%.2f%s",
+                            trail_str = (f"  peak={pos.peak_gain*100:+.3f}%"
+                                         if pos.peak_gain >= TRAIL_TRIGGER else "")
+                            log.info("%-8s %s hold  gain=%+.3f%%  TP=£%.2f  SL=£%.2f%s%s",
                                      pair, pos.direction, gain*100, tp, sl,
-                                     " [+pyramid pending]" if pos.has_pending else "")
-                    else:
-                        log.info("%-8s %s hold  gain=%+.3f%%", pair, pos.direction, gain*100)
+                                     " [+pyramid pending]" if pos.has_pending else "",
+                                     trail_str)
 
                 # ── Entry signals ──────────────────────────────────────────────
                 elif pos is None or not pos.has_pending:
@@ -407,6 +414,7 @@ def run_bot():
                     "sl_level":   pos.sl_level,
                     "gain_pct":   round(pos.current_gain(current_prices[pair]) * 100, 3)
                                   if pos.in_position and pair in current_prices else None,
+                    "peak_gain":  round(pos.peak_gain * 100, 3),
                     "price":      current_prices.get(pair),
                     "pending_price": pos.pending["limit"] if pos.has_pending else None,
                 }
@@ -482,8 +490,11 @@ def render_html(s: dict) -> str:
             tp_str    = f"£{pos['tp_target']:,.2f}" if pos["tp_target"] else "—"
             sl_str    = f"£{pos['sl_level']:,.2f}"  if pos["sl_level"]  else "—"
             pend_str  = f"£{pos['pending_price']:,.2f}" if pos["pending_price"] else ""
-            pyra_badge= ' <span style="color:#f39c12;font-size:10px">+PYRAMID</span>' if pos["pyramided"] else ""
-            status_lbl= f'{d} ▲{pyra_badge}' if d == LONG else f'{d} ▼{pyra_badge}'
+            pyra_badge = ' <span style="color:#f39c12;font-size:10px">+PYRAMID</span>' if pos["pyramided"] else ""
+            peak       = pos.get("peak_gain", 0) or 0
+            trail_badge= (f' <span style="color:#3498db;font-size:10px">TRAIL {peak:+.2f}%</span>'
+                          if peak >= TRAIL_TRIGGER * 100 else "")
+            status_lbl = f'{d} ▲{pyra_badge}{trail_badge}' if d == LONG else f'{d} ▼{pyra_badge}{trail_badge}'
             if pos["has_pending"] and not pos["in_position"]:
                 status_lbl = f'PENDING {d} @ {pend_str}'
                 d_col = "#f39c12"
