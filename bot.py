@@ -31,7 +31,7 @@ LIMIT, MARKET = "LIMIT", "MARKET"
 
 # ── Config ────────────────────────────────────────────────────────────────────
 PAIRS           = os.getenv("PAIRS",    "ETHGBP,XBTGBP,SOLGBP").split(",")
-POLL_SEC        = int(os.getenv("POLL_SEC",    "15"))
+POLL_SEC        = int(os.getenv("POLL_SEC",    "60"))
 SESSION_SEC     = int(os.getenv("SESSION_SEC", "86400"))
 TOTAL_CAPITAL   = float(os.getenv("TOTAL_CAPITAL", "10000"))
 INITIAL_FRAC    = float(os.getenv("INITIAL_FRAC",  "0.15"))    # 15% per initial entry (was 0.25 — smaller positions = lower fees)
@@ -43,8 +43,8 @@ FEE_MAKER       = float(os.getenv("FEE_MAKER",  "0.0014"))
 FEE_TAKER       = float(os.getenv("FEE_TAKER",  "0.0024"))
 MARGIN_OPEN     = float(os.getenv("MARGIN_OPEN","0.0002"))
 MARGIN_4H       = float(os.getenv("MARGIN_4H",  "0.0002"))
-TP_PCT          = float(os.getenv("TP_PCT",  "0.0045"))        # 0.45% take-profit — matches observed market swing distance before reversal
-SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss — wider than TP to allow breathing room
+TP_PCT          = float(os.getenv("TP_PCT",  "0.0100"))        # 1.00% take-profit — viable on 60s polls where market sustains larger moves
+SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss
 MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0008"))    # 0.08% min move (was 0.05% — higher conviction entries)
 TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "40"))        # EMA length for trend filter (40 ticks ≈ 10 min)
 SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "5"))         # ticks to wait after a stop-loss
