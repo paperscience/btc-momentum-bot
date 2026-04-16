@@ -46,10 +46,10 @@ MARGIN_4H       = float(os.getenv("MARGIN_4H",  "0.0002"))
 TP_PCT          = float(os.getenv("TP_PCT",  "0.0100"))        # 1.00% take-profit — viable on 60s polls where market sustains larger moves
 SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss
 MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0008"))    # 0.08% min move (was 0.05% — higher conviction entries)
-TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "40"))        # EMA length for trend filter (40 ticks ≈ 40 min at 60s)
+TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "120"))       # EMA length for trend filter (120 ticks = 2h at 60s)
 TRAIL_TRIGGER   = float(os.getenv("TRAIL_TRIGGER", "0.0050"))  # activate trailing stop once gain > 0.50%
 TRAIL_DIST      = float(os.getenv("TRAIL_DIST",    "0.0030"))  # trail 0.30% below peak gain
-SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "5"))         # ticks to wait after a stop-loss
+SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "15"))        # ticks to wait after a stop-loss (15 min at 60s)
 LIMIT_EXPIRY    = int(os.getenv("LIMIT_EXPIRY",  "3"))
 PORT            = int(os.getenv("PORT", "8080"))
 KRAKEN_API      = "https://api.kraken.com/0/public"
@@ -147,8 +147,9 @@ class Portfolio:
     short_count:  int   = 0
 
     def direction_count(self, direction: str) -> int:
+        # Count both filled positions AND pending orders in same direction
         return sum(1 for p in self.positions.values()
-                   if p.in_position and p.direction == direction)
+                   if p.direction == direction and (p.in_position or p.has_pending))
 
     def _can_spend(self, amount: float) -> bool:
         return self.cash - amount >= RESERVE_MIN
