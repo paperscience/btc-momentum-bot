@@ -47,7 +47,7 @@ TP_PCT          = float(os.getenv("TP_PCT",  "0.0100"))        # 1.00% take-prof
 SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss
 MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0008"))    # 0.08% min move (was 0.05% — higher conviction entries)
 TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "120"))       # EMA length for trend filter (120 ticks = 2h at 60s)
-TRAIL_TRIGGER   = float(os.getenv("TRAIL_TRIGGER", "0.0050"))  # activate trailing stop once gain > 0.50%
+TRAIL_TRIGGER   = float(os.getenv("TRAIL_TRIGGER", "0.0065"))  # activate trailing stop once gain > 0.65% (covers fees at worst-case trail exit)
 TRAIL_DIST      = float(os.getenv("TRAIL_DIST",    "0.0030"))  # trail 0.30% below peak gain
 SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "15"))        # ticks to wait after a stop-loss (15 min at 60s)
 LIMIT_EXPIRY    = int(os.getenv("LIMIT_EXPIRY",  "3"))
