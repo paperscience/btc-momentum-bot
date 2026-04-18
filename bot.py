@@ -46,7 +46,9 @@ MARGIN_4H       = float(os.getenv("MARGIN_4H",  "0.0002"))
 TP_PCT          = float(os.getenv("TP_PCT",  "0.0100"))        # 1.00% take-profit — viable on 60s polls where market sustains larger moves
 SL_PCT          = float(os.getenv("SL_PCT",  "0.0060"))        # 0.60% stop-loss
 MOMENTUM_MIN    = float(os.getenv("MOMENTUM_MIN","0.0008"))    # 0.08% min move (was 0.05% — higher conviction entries)
-TREND_EMA_LEN   = int(os.getenv("TREND_EMA_LEN", "120"))       # EMA length for trend filter (120 ticks = 2h at 60s)
+TREND_EMA_FAST  = int(os.getenv("TREND_EMA_FAST", "20"))        # fast EMA: 20 min — reacts quickly to trend changes
+TREND_EMA_SLOW  = int(os.getenv("TREND_EMA_SLOW", "120"))       # slow EMA: 2h — defines the broader trend
+# Filter: only LONG when fast > slow (uptrend), only SHORT when fast < slow (downtrend)
 TRAIL_TRIGGER   = float(os.getenv("TRAIL_TRIGGER", "0.0065"))  # activate trailing stop once gain > 0.65% (covers fees at worst-case trail exit)
 TRAIL_DIST      = float(os.getenv("TRAIL_DIST",    "0.0030"))  # trail 0.30% below peak gain
 SL_COOLDOWN     = int(os.getenv("SL_COOLDOWN",   "15"))        # ticks to wait after a stop-loss (15 min at 60s)
@@ -299,7 +301,8 @@ def run_bot():
         portfolio     = Portfolio()
         price_history = {p: deque(maxlen=3) for p in PAIRS}  # only last 3 needed
         sl_cooldown   = {p: 0 for p in PAIRS}               # ticks remaining before re-entry allowed
-        trend_ema     = {p: None for p in PAIRS}             # EMA of mid prices for trend filter
+        ema_fast      = {p: None for p in PAIRS}             # fast EMA (20 ticks) for trend crossover
+        ema_slow      = {p: None for p in PAIRS}             # slow EMA (120 ticks) for trend crossover
         start         = time.time()
 
         with state_lock:
@@ -327,9 +330,11 @@ def run_bot():
                 current_prices[pair] = mid
                 hist = price_history[pair]
                 hist.append(mid)
-                # Update EMA for trend filter
-                k = 2 / (TREND_EMA_LEN + 1)
-                trend_ema[pair] = mid if trend_ema[pair] is None else mid * k + trend_ema[pair] * (1 - k)
+                # Update dual EMA for trend crossover filter
+                kf = 2 / (TREND_EMA_FAST + 1)
+                ks = 2 / (TREND_EMA_SLOW + 1)
+                ema_fast[pair] = mid if ema_fast[pair] is None else mid * kf + ema_fast[pair] * (1 - kf)
+                ema_slow[pair] = mid if ema_slow[pair] is None else mid * ks + ema_slow[pair] * (1 - ks)
                 pos  = portfolio.positions.get(pair)
                 move = (mid - hist[-2]) / hist[-2] * 100 if len(hist) >= 2 else 0.0
 
@@ -385,18 +390,23 @@ def run_bot():
                         cum_dn = (hist[-3] - hist[-1]) / hist[-3]
                         up = hist[-1] > hist[-2] > hist[-3]
                         dn = hist[-1] < hist[-2] < hist[-3]
-                        ema  = trend_ema[pair]
-                        # Trend filter: only trade with the EMA direction
-                        with_trend_long  = ema is None or mid > ema
-                        with_trend_short = ema is None or mid < ema
+                        ef = ema_fast[pair]
+                        es = ema_slow[pair]
+                        # Dual EMA crossover: fast > slow = uptrend, fast < slow = downtrend
+                        # Both EMAs must exist (fast warms up in ~20 ticks, slow in ~120)
+                        if ef is None or es is None:
+                            trend_up = trend_dn = True   # no filter until EMAs warm up
+                        else:
+                            trend_up = ef > es
+                            trend_dn = ef < es
 
-                        if up and cum_up >= MOMENTUM_MIN and with_trend_long:
+                        if up and cum_up >= MOMENTUM_MIN and trend_up:
                             portfolio.place_entry(pair, LONG, bid)
-                        elif dn and cum_dn >= MOMENTUM_MIN and with_trend_short:
+                        elif dn and cum_dn >= MOMENTUM_MIN and trend_dn:
                             portfolio.place_entry(pair, SHORT, ask)
                         elif (up and cum_up >= MOMENTUM_MIN) or (dn and cum_dn >= MOMENTUM_MIN):
-                            log.info("%-8s SKIP %s — counter-trend (mid=£%.2f ema=£%.2f)",
-                                     pair, LONG if up else SHORT, mid, ema or 0)
+                            log.info("%-8s SKIP %s — counter-trend (fast=%.2f slow=%.2f)",
+                                     pair, LONG if up else SHORT, ef or 0, es or 0)
                         else:
                             log.info("%-8s watch  £%.2f  %+.3f%%", pair, mid, move)
                     else:
