@@ -30,7 +30,7 @@ BUY,   SELL   = "BUY",   "SELL"
 LIMIT, MARKET = "LIMIT", "MARKET"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-PAIRS           = os.getenv("PAIRS",    "ETHGBP,XBTGBP,SOLGBP").split(",")
+PAIRS           = os.getenv("PAIRS",    "ETHGBP,XBTGBP").split(",")
 POLL_SEC        = int(os.getenv("POLL_SEC",    "60"))
 SESSION_SEC     = int(os.getenv("SESSION_SEC", "86400"))
 TOTAL_CAPITAL   = float(os.getenv("TOTAL_CAPITAL", "10000"))
