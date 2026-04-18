@@ -544,8 +544,16 @@ def render_html(s: dict) -> str:
         if entries:
             rounds.append({"entries": entries, "close": None})
 
+    # Pre-compute running P&L per round (oldest → newest)
+    running = 0.0
+    running_pnl = []
+    for r in rounds:
+        if r["close"] and r["close"]["net_pnl"] is not None:
+            running += r["close"]["net_pnl"]
+        running_pnl.append(running if (r["close"] and r["close"]["net_pnl"] is not None) else None)
+
     rows = ""
-    for i, r in enumerate(reversed(rounds), 1):
+    for i, (r, run_val) in enumerate(zip(reversed(rounds), reversed(running_pnl)), 1):
         entries = r["entries"]
         close   = r["close"]
         if not entries and not close:
@@ -574,19 +582,27 @@ def render_html(s: dict) -> str:
 
         # Close cell
         if close:
-            reason    = close["reason"].split(" (")[0]   # trim "(market)" etc.
+            reason     = close["reason"].split(" (")[0]
             reason_col = ("#2ecc71" if "TAKE-PROFIT" in reason
                           else "#e74c3c" if "STOP-LOSS" in reason
                           else "#888")
-            close_td  = (f'{close["time"]} &nbsp; £{close["price"]:,.2f}'
-                         f'<br><span style="font-size:10px;color:{reason_col}">{reason}</span>')
-            pnl       = close["net_pnl"]
-            pnl_str   = f"£{pnl:+.4f}"
-            pnl_col   = "#2ecc71" if pnl > 0 else "#e74c3c" if pnl < 0 else "#888"
+            close_td   = (f'{close["time"]} &nbsp; £{close["price"]:,.2f}'
+                          f'<br><span style="font-size:10px;color:{reason_col}">{reason}</span>')
+            pnl        = close["net_pnl"]
+            pnl_str    = f"£{pnl:+.2f}"
+            pnl_col    = "#2ecc71" if pnl > 0 else "#e74c3c" if pnl < 0 else "#888"
         else:
             close_td  = '<span style="color:#f39c12;font-size:11px">● OPEN</span>'
             pnl_str   = "—"
             pnl_col   = "#888"
+
+        # Running P&L cell
+        if run_val is not None:
+            run_col = "#2ecc71" if run_val >= 0 else "#e74c3c"
+            run_str = f"£{run_val:+.2f}"
+        else:
+            run_col = "#555"
+            run_str = "—"
 
         rows += f"""<tr>
           <td style="color:#555;font-size:11px">{len(rounds)-i+1}</td>
@@ -594,8 +610,9 @@ def render_html(s: dict) -> str:
               <span style="font-size:10px;margin-left:4px">{dir_icon}</span></td>
           <td style="line-height:1.6">{entry_td}</td>
           <td style="line-height:1.6">{close_td}</td>
-          <td style="color:#555;font-size:11px">£{total_fee:.4f}</td>
-          <td style="color:{pnl_col};font-weight:bold;font-size:14px">{pnl_str}</td>
+          <td style="color:#555;font-size:11px">£{total_fee:.2f}</td>
+          <td style="color:{pnl_col};font-weight:bold">{pnl_str}</td>
+          <td style="color:{run_col};font-weight:bold;border-left:1px solid #1c1c38">{run_str}</td>
         </tr>"""
 
     pnl     = s["session_pnl"]
@@ -653,8 +670,8 @@ def render_html(s: dict) -> str:
 
   <div class="sec">Trade Log</div>
   <table>
-    <tr><th>#</th><th>Pair</th><th>Entry</th><th>Exit</th><th>Fees</th><th>P&amp;L</th></tr>
-    {"".join(rows) or "<tr><td colspan='6' style='text-align:center;color:#333;padding:20px'>No trades yet</td></tr>"}
+    <tr><th>#</th><th>Pair</th><th>Entry</th><th>Exit</th><th>Fees</th><th>P&amp;L</th><th style="border-left:1px solid #1c1c38">Running</th></tr>
+    {"".join(rows) or "<tr><td colspan='7' style='text-align:center;color:#333;padding:20px'>No trades yet</td></tr>"}
   </table>
 </body>
 </html>"""
